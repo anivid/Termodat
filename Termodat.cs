@@ -4,21 +4,6 @@ using System.IO.Ports;
 
 namespace Termodat
 {
-    public enum StateProgarm
-    {
-        HeatingOrCooling = 0,
-        Exposure = 1,
-        Goto = 2,
-        Stop = 3
-    }
-    public enum StateProcess
-    {
-        Run,
-        Stop,
-        Pause,
-        Undefined
-    }
-
     public class Termodat
     {
         private SerialPort _serial;
@@ -26,8 +11,9 @@ namespace Termodat
         private readonly int _channel;
         private const int _baudrate = 57600;
         private const int _dataBits = 8;
+        private int _nProgram; //Номер программы регулирования, с которой запускать процесс 0x017b StartProcess()
+        private int _nStepProgram; //Номер шага программы регулирования, с которого запускать процесс 0x017c StartProcess() 
 
-        public int Channels { get; private set; }
         public double Temp //текущая температура 0x0170
         {
             get
@@ -36,16 +22,17 @@ namespace Termodat
             }
             private set { }
         }
-        public double SetPoint //текущая уставка 0x0173
+        public double SetPoint //текущая уставка 0x0171
         {
             get
             {
-                return getDoubleValue(0x0173, 1);
+                return getDoubleValue(0x0171, 1);
             }
             private set { }
         }
-        public int NProgram { get; private set; } = 0; //Номер программы регулирования, с которой запускать процесс 0x017b
-        public int NStepProgram { get; private set; } //Номер шага программы регулирования, с которого запускать процесс 0x017c        
+        public int Channels { get; private set; }
+        public int CurrentNProgram { get; private set; }
+        public int CurrentNStepProgram { get; private set; }
         public int TimeLeftStand //Оставшееся время выдержки, мин. 0x0178
         {
             get
@@ -55,7 +42,18 @@ namespace Termodat
             private set {}
         } 
         public string Log { get; private set; }
-        public StateProcess StateProcess { get; private set; } = StateProcess.Undefined;
+        public bool IsConnect
+        {
+            get
+            {
+                if (getIntValue(0x0130, 1) != -1)
+                    return true;
+                else return false;
+            }
+            private set { }
+        }
+        public StateProcess StateProcess { get; private set; }
+        public StateProgram StateProgram { get; private set; }
 
         public Termodat(string COMPort, int devAddress, int channel = 1, int nProg = 1, int nStep = 1)
         {
@@ -64,35 +62,62 @@ namespace Termodat
                 BaudRate = _baudrate,
                 Parity = Parity.None,
                 StopBits = StopBits.One,
-                DataBits = _dataBits
+                DataBits = _dataBits, ReadTimeout = 5000
                 //DataBits = _dataBits
+                
             };
             _devAddress = devAddress;
+            _nProgram = nProg; _nStepProgram = nStep;
 
             Channels = getIntValue(0x0130, 1);
 
+            if (Channels == -1) throw new IOException("Timeout of response Termodat. Check your connection with device or settings");
             if (channel>Channels || channel<1) throw new ArgumentOutOfRangeException($"***Number of termodat channel must be in range [1-{Channels}]***");
             else _channel = channel;
 
-            this.SetStartupSettings(nProg, nStep);            
+            this.SetStartupSettings(_nProgram, _nStepProgram); //Установить начальную программу и шаг программы, по умолчанию 1-1
+            this.GetStateProcess(); //Узнать текущее состояние процесса (термодат возобновляет предыдущее состояние после выключения)
         }
 
         public void StartProcess(int nProg, int nStep) //0x0180 val 1
         {
+            if (StateProcess == StateProcess.Run) return;
             this.SetStartupSettings(nProg, nStep);
             this.Set(0x180, 1);
             StateProcess = StateProcess.Run;
         }
         public void StartProcess() //перегрузка, процесс запустится с ранее заданным номером программы 
         {
+            if (StateProcess == StateProcess.Run) return;
             this.Set(0x180, 1);
             StateProcess = StateProcess.Run;
         }
         public void PauseProcess() //0x0180 val 2
         {
-            this.Set(0x180, 1);
+            if (StateProcess == StateProcess.Pause) return;
+            this.Set(0x180, 2);
             StateProcess = StateProcess.Pause;
         }
+        public void StopProcess() //0x0180 val 0
+        {
+            if (StateProcess == StateProcess.Stop) return;
+            this.Set(0x180, 0);
+            StateProcess = StateProcess.Stop;
+        }
+        public void SetupProgram(int nProg, int nStep, StateProgram program, int param1, int param2, TransitionCondition condition)        
+        {
+            //( [Номер редактируемой программы], [Номер редактируемого шага], [Тип шага: 0 – нагрев либо охлаждение, 1 – выдержка, 2 – переход на программу, 3 – стоп (регулирование выключено)]
+            //  [Параметр 1 (время выдержки, либо скорость (0,1ºC/ч), либо номер программы, либо заданное значение выводимой мощности)], [Параметр 2 (целевая уставка в 0,1ºC)],
+            //  [Условие перехода на следующий шаг (0 – T расчетная = SP, 1 – Ручное подтверждение, 2 – T измеренная = SP)] )
+
+            this.Set(0x0160, (long)nProg-1); //Номер редактируемой программы
+            this.Set(0x0161, (long)nStep - 1); //Номер редактируемого шага
+            this.Set(0x0162, (int)program); //Тип шага
+            this.Set(0x0163, param1);
+            this.Set(0x0164, param2);
+            this.Set(0x0165, (int)condition);
+        }
+
         public void Set(long registerAddress, long value)
         {
             //byte[] bytes = new byte[20];
@@ -112,18 +137,29 @@ namespace Termodat
             _serial.Close();
             //if (response == packet.Remove(packet.Length-1,1)) return true; //не возвращается <LF>
             //else return false;            
-        }
+        } //сделать private после отладки
 
         #region Private methods        
         private void SetStartupSettings (int nProg, int nStep)
         {
-            NProgram = nProg; NStepProgram = nStep;
+            _nProgram = nProg; _nStepProgram = nStep;
             this.Set(0x017b, nProg - 1);
             this.Set(0x017c, nStep - 1);
         }
+        private void GetStateProcess()
+        {
+
+            switch (getIntValue(0x0180, 1))
+            {
+                case 0: StateProcess = StateProcess.Stop;       break;
+                case 1: StateProcess = StateProcess.Run;        break;
+                case 2: StateProcess = StateProcess.Pause;      break;
+                default: StateProcess = StateProcess.Undefined; return;
+            }
+        }       
 
         #region Getting values
-        private int getIntValue(long registerAddress, long amountOfVals)
+        public int getIntValue(long registerAddress, long amountOfVals)
         {
             int res = -1;
             _serial.Open();            
